@@ -1,106 +1,56 @@
+# CLAUDE.md
 
-Default to using Bun instead of Node.js.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-- Use `bun <file>` instead of `node <file>` or `ts-node <file>`
-- Use `bun test` instead of `jest` or `vitest`
-- Use `bun build <file.html|file.ts|file.css>` instead of `webpack` or `esbuild`
-- Use `bun install` instead of `npm install` or `yarn install` or `pnpm install`
-- Use `bun run <script>` instead of `npm run <script>` or `yarn run <script>` or `pnpm run <script>`
-- Use `bunx <package> <command>` instead of `npx <package> <command>`
-- Bun automatically loads .env, so don't use dotenv.
+## What this is
 
-## APIs
+An SDK that lets an app's end users "Login with ChatGPT" and then call OpenAI models **on the user's own ChatGPT subscription** — the app supplies no OpenAI API key. It works by driving OpenAI's Codex OAuth device-code flow (`auth.openai.com`, Codex `client_id` in `packages/core/src/constants.ts`) and proxying the Codex Responses API. Access/refresh/id tokens are server secrets: encrypted at rest, never sent to the browser. The browser holds only an HttpOnly session cookie plus public user claims (account id, email, name, plan).
 
-- `Bun.serve()` supports WebSockets, HTTPS, and routes. Don't use `express`.
-- `bun:sqlite` for SQLite. Don't use `better-sqlite3`.
-- `Bun.redis` for Redis. Don't use `ioredis`.
-- `Bun.sql` for Postgres. Don't use `pg` or `postgres.js`.
-- `WebSocket` is built-in. Don't use `ws`.
-- Prefer `Bun.file` over `node:fs`'s readFile/writeFile
-- Bun.$`ls` instead of execa.
+## Commands
 
-## Testing
+Bun-first monorepo (Bun workspaces). Run from the repo root:
 
-Use `bun test` to run tests.
+- `bun install` — install all workspaces
+- `bun test` — run the full test suite (`bun test packages`)
+- `bun test packages/core` — test one package; `bun test packages/core/test/oauth.test.ts` for one file; `bun test -t "pattern"` for one test by name
+- `bun run typecheck` — `tsc --build` across all project refs (the real "does it compile" gate)
+- `bun run build` — emit `dist/` for the four published packages (ordered: core → server → react → ai)
+- `bun run demo` — run `examples/demo` (`bun --hot`), a full working app
+- `bun run docs` (alias `dev`) — Fumadocs/Next.js docs site on `PORT` (default 3001)
 
-```ts#index.test.ts
-import { test, expect } from "bun:test";
+There is no separate lint step in the packages; `typecheck` + `test` are the gates. (The `docs/` subpackage has its own Biome config and `bun.lock` — treat it as a separate project.)
 
-test("hello world", () => {
-  expect(1).toBe(1);
-});
-```
+## Architecture
 
-## Frontend
+Four published packages in `packages/`, layered so `core` has zero runtime deps and everything else builds on it:
 
-Use HTML imports with `Bun.serve()`. Don't use `vite`. HTML imports fully support React, CSS, Tailwind.
+- **`core`** (`@opencoredev/loginwithchatgpt-core`) — framework-agnostic engine, only Web-standard `fetch`/`crypto`. Owns the OAuth mechanics and has **no session/cookie/HTTP-server concept**. Key modules: `device.ts` (device-code request/poll/exchange), `oauth.ts` + `pkce.ts` (loopback PKCE flow), `tokens.ts` (`ensureFreshTokens` refresh-on-expiry), `jwt.ts` (decode id-token → `ChatGPTUser`, `deriveAccountId`), `codex-transport.ts` (`createCodexFetch`, `listCodexModels`, request normalization/filtering for the Codex Responses endpoint), `store.ts` (`KeyValueStore` interface + `MemoryStore`).
+- **`server`** (`@opencoredev/loginwithchatgpt-server`) — `createChatGPTHandler()` returns **one** Web-standard `(Request) => Response` handler mounted at a base path (default `/api/chatgpt`). This is the heart of the repo (`handler.ts`, ~680 lines). Routes: `POST /login`, `GET /status`, `GET /session`, `POST /logout`, and (when the responses proxy is enabled, default on) `POST /responses` + `GET /models`. `session.ts` is the state machine + storage; `crypto.ts` does cookie signing (`sign`/`unsign`) and token encryption (`encryptJson`/`decryptJson`) keyed by `LWC_SECRET`; `cookies.ts` handles the HttpOnly session cookie.
+- **`react`** (`@opencoredev/loginwithchatgpt-react`) — `useLoginWithChatGPT()` hook (drives login/polling against the backend handler) and the styled `<LoginWithChatGPT />` button. Talks only to your backend routes, never to OpenAI directly.
+- **`ai`** (`@opencoredev/loginwithchatgpt-ai`) — Vercel AI SDK provider (`createChatGPT`, `createChatGPTProxyProvider`) so client/server code calls `streamText()`/`generateText()` through the proxy like any other provider. `ai` and `@ai-sdk/openai` are **peer** deps.
 
-Server:
+### Load-bearing invariants
 
-```ts#index.ts
-import index from "./index.html"
+- **Token boundary**: `accessToken`/`refreshToken`/`idToken` never appear in any route response. `dangerouslyGetTokens()` / `dangerouslyAllowTokenExport` exist but are off by default and named to warn — don't route around this to "make it work." Only `ChatGPTUser` is browser-visible.
+- **Serverless-safe polling**: the server runs no background loop. Each `GET /status` advances **at most one** upstream poll, rate-limited per session via `lastPolledAt` at the interval OpenAI requested. All flow state lives in the session store.
+- **Session state machine** (server session and React hook share it): `unauthenticated → pending → authenticated`, or `→ expired` (device codes expire ~15 min). The hook adds client-only `loading` and `connecting` states.
+- **`LWC_SECRET`** signs the cookie and encrypts tokens. Without it the SDK generates an ephemeral secret and logs everyone out on restart — set it (`openssl rand -hex 32`) for anything real.
+- **`/responses` proxy guardrails** live in `ResponsesProxyPolicy` (handler options): `allowedModels`, max body size (default 8 MiB), per-session rate limit (default 30/window), default injected model.
 
-Bun.serve({
-  routes: {
-    "/": index,
-    "/api/users/:id": {
-      GET: (req) => {
-        return new Response(JSON.stringify({ id: req.params.id }));
-      },
-    },
-  },
-  // optional websocket support
-  websocket: {
-    open: (ws) => {
-      ws.send("Hello, world!");
-    },
-    message: (ws, message) => {
-      ws.send(message);
-    },
-    close: (ws) => {
-      // handle close
-    }
-  },
-  development: {
-    hmr: true,
-    console: true,
-  }
-})
-```
+## Conventions
 
-HTML files can import .tsx, .jsx or .js files directly and Bun's bundler will transpile & bundle automatically. `<link>` tags can point to stylesheets and Bun's CSS bundler will bundle.
+- **Bun for everything** — `bun <file>` not `node`; `bun test` not jest/vitest; `bun install`; `bunx` not `npx`. Bun auto-loads `.env` (no `dotenv`). Prefer Bun built-ins (`Bun.serve`, `bun:sqlite`, `Bun.file`, `Bun.$`) over Express/node:fs/execa. The demo server uses `Bun.serve()` with HTML imports.
+- **ESM + explicit `.ts` extensions** in imports (see any `index.ts`). Targets Node 18+ / Bun / edge.
+- Packages are published to npm under the `@opencoredev/loginwithchatgpt-*` scope; `bun run release` builds then `npm publish`es all four.
 
-```html#index.html
-<html>
-  <body>
-    <h1>Hello, world!</h1>
-    <script type="module" src="./frontend.tsx"></script>
-  </body>
-</html>
-```
+## Android port (`android/`)
 
-With the following `frontend.tsx`:
+An on-device Kotlin port of the SDK lives in `android/` — a separate Gradle project, not part of the Bun workspace. Three modules: `lwc-core` (pure Kotlin/JVM engine mirroring `packages/core`, JUnit tests ported from the TS oracles), `lwc-android` (Keystore token store + Custom Tab + facade), `sample` (Compose demo). Unlike the web SDK there is no server: tokens live on-device in Keystore-backed encrypted storage.
 
-```tsx#frontend.tsx
-import React from "react";
-import { createRoot } from "react-dom/client";
+- Build with the **committed wrapper** (`.\gradlew.bat` / `./gradlew`, Gradle 8.11.1) — a newer system Gradle is incompatible with the pinned AGP.
+- Gates: `./gradlew :lwc-core:test` (unit) and `./gradlew :lwc-core:run --args="..."` (live spike; needs an interactive ChatGPT device login, so only a human can run it).
+- Wire-format rules the live run proved (encoded in `CodexTransport.kt`): `/responses` needs `stream: true` for SSE, and `input` must be a list of message items — a bare string is rejected with `400 {"detail":"Input must be a list"}`. Keep the Kotlin transport behavior in lockstep with `packages/core/src/codex-transport.ts` when either changes.
 
-// import .css files directly and it works
-import './index.css';
+## Working with OpenAI's endpoints
 
-const root = createRoot(document.body);
-
-export default function Frontend() {
-  return <h1>Hello, world!</h1>;
-}
-
-root.render(<Frontend />);
-```
-
-Then, run index.ts
-
-```sh
-bun --hot ./index.ts
-```
-
-For more information, read the Bun API docs in `node_modules/bun-types/docs/**.mdx`.
+This rides on OpenAI's Codex OAuth client and `chatgpt.com/backend-api/codex`, not an official third-party-login product. When touching `core`'s transport/oauth/device code, don't invent API-key auth paths, and don't assume one model slug works for every account — model availability is per-account and discovered via `/models` (`listCodexModels`). The `skills/login-with-chatgpt/SKILL.md` agent skill encodes these same rules for coding agents.
